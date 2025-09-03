@@ -1,0 +1,16 @@
+email,username,fullName,department,position,walletAddress,role
+john.doe@company.com,johndoe,John Doe,Engineering,Senior Developer,0x123d35Cc6634C0532925a3b8D4C8C6dF156E5B6C,team_member
+sarah.wilson@company.com,sarahw,Sarah Wilson,Marketing,Marketing Manager,0x456d35Cc6634C0532925a3b8D4C8C6dF156E5B6C,project_lead
+mike.chen@company.com,mikec,Mike Chen,Engineering,Junior Developer,0x789d35Cc6634C0532925a3b8D4C8C6dF156E5B6C,team_member
+lisa.garcia@company.com,lisag,Lisa Garcia,HR,HR Specialist,0xABCd35Cc6634C0532925a3b8D4C8C6dF156E5B6C,team_member
+david.brown@company.com,davidb,David Brown,Sales,Sales Representative,0xDEFd35Cc6634C0532925a3b8D4C8C6dF156E5B6C,team_member
+emma.taylor@company.com,emmat,Emma Taylor,Design,UI/UX Designer,0x111d35Cc6634C0532925a3b8D4C8C6dF156E5B6C,team_member
+alex.johnson@company.com,alexj,Alex Johnson,Engineering,Intern,0x222d35Cc6634C0532925a3b8D4C8C6dF156E5B6C,intern
+maria.rodriguez@company.com,mariar,Maria Rodriguez,Finance,Financial Analyst,0x333d35Cc6634C0532925a3b8D4C8C6dF156E5B6C,team_member
+james.lee@company.com,jamesl,James Lee,Operations,Operations Manager,0x444d35Cc6634C0532925a3b8D4C8C6dF156E5B6C,project_lead
+anna.kim@company.com,annak,Anna Kim,Engineering,Student Intern,0x555d35Cc6634C0532925a3b8D4C8C6dF156E5B6C,student
+robert.white@company.com,robertw,Robert White,Marketing,Content Creator,0x666d35Cc6634C0532925a3b8D4C8C6dF156E5B6C,team_member
+jennifer.davis@company.com,jenniferd,Jennifer Davis,HR,Recruiter,0x777d35Cc6634C0532925a3b8D4C8C6dF156E5B6C,team_member
+kevin.martinez@company.com,kevinm,Kevin Martinez,Sales,Sales Manager,0x888d35Cc6634C0532925a3b8D4C8C6dF156E5B6C,project_lead
+sophia.anderson@company.com,sophiaa,Sophia Anderson,Design,Graphic Designer,0x999d35Cc6634C0532925a3b8D4C8C6dF156E5B6C,team_member
+daniel.thomas@company.com,danielt,Daniel Thomas,Engineering,DevOps Engineer,0xAABd35Cc6634C0532925a3b8D4C8C6dF156E5B6C,team_member
