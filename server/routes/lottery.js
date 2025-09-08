@@ -496,47 +496,6 @@ router.post('/perks/:id/redeem', authenticateToken, async (req, res) => {
   }
 });
 
-      await db.query(`
-        INSERT INTO lottery_rounds (round_name, start_date, end_date, perk_description)
-        VALUES (?, datetime('now'), ?, 'Mystery Perk')
-      `, [`Round ${round.id + 1}`, newEndDate.toISOString()]);
-
-      await db.query('COMMIT');
-    } catch (dbError) {
-      await db.query('ROLLBACK');
-      throw dbError;
-    }
-
-    // Blockchain lottery draw
-    try {
-      await blockchain.drawLottery();
-      await blockchain.awardTokens(winningTicket.wallet_address, 100, 'Lottery winner');
-    } catch (blockchainError) {
-      console.error('Blockchain lottery draw failed:', blockchainError);
-    }
-
-    // Notify all users
-    req.io.emit('lottery-drawn', {
-      winner: winningTicket.username,
-      ticketNumber: winningTicket.ticket_number,
-      roundId: round.id
-    });
-
-    res.json({
-      winner: {
-        id: winningTicket.user_id,
-        username: winningTicket.username,
-        ticketNumber: winningTicket.ticket_number
-      },
-      roundId: round.id,
-      totalTickets: tickets.rows.length
-    });
-  } catch (error) {
-    console.error('Draw lottery error:', error);
-    res.status(500).json({ error: 'Failed to draw lottery' });
-  }
-});
-
 // Get user's perk redemptions
 router.get('/my-perks', authenticateToken, async (req, res) => {
   try {

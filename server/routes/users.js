@@ -787,4 +787,46 @@ router.get('/achievements', authenticateToken, async (req, res) => {
   }
 });
 
+// Get user stats for dashboard
+router.get('/stats', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // Get user stats including task counts and tokens
+    const userStats = await db.query(`
+      SELECT 
+        u.total_tokens,
+        u.current_streak,
+        COALESCE(task_counts.total_tasks, 0) as total_tasks,
+        COALESCE(task_counts.completed_tasks, 0) as completed_tasks
+      FROM users u
+      LEFT JOIN (
+        SELECT 
+          assigned_to,
+          COUNT(*) as total_tasks,
+          COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_tasks
+        FROM tasks
+        WHERE assigned_to = ?
+        GROUP BY assigned_to
+      ) task_counts ON u.id = task_counts.assigned_to
+      WHERE u.id = ?
+    `, [userId, userId]);
+    
+    if (userStats.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const stats = userStats[0];
+    res.json({
+      totalTasks: stats.total_tasks,
+      completedTasks: stats.completed_tasks,
+      totalTokens: stats.total_tokens,
+      currentStreak: stats.current_streak
+    });
+  } catch (error) {
+    console.error('Get stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch user stats' });
+  }
+});
+
 module.exports = router;

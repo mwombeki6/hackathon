@@ -351,7 +351,7 @@ class BlockchainService {
 
   // Event listener setup for blockchain synchronization
   setupEventListeners() {
-    if (!this.isConnected) return;
+    if (!this.isConnected || !this.contracts) return;
     
     try {
       // Task events

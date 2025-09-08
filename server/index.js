@@ -27,6 +27,7 @@ const io = new Server(server, {
 });
 
 // Middleware
+app.set('trust proxy', true);
 app.use(helmet());
 app.use(cors());
 app.use(morgan('combined'));

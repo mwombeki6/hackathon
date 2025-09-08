@@ -1,6 +1,6 @@
 {
-  "../lib/openzeppelin-contracts": {
-    "rev": "c64a1edb67b6e3f4a15cca8909c9482ad33a02b0"
+  "contracts/lib/openzeppelin-contracts": {
+    "rev": "0cb4888ba2d7ca85f3354aa8eb86e60aa5524dd7"
   },
   "lib/openzeppelin-contracts": {
     "tag": {

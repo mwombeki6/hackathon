@@ -30,8 +30,8 @@ CREATE TABLE users (
     streak_level VARCHAR(50) DEFAULT 'none',
     badges TEXT DEFAULT '[]',
     password_hash VARCHAR(255) NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT (datetime('now')),
+    updated_at DATETIME DEFAULT (datetime('now'))
 );
 
 -- Tasks table
@@ -50,8 +50,8 @@ CREATE TABLE tasks (
     completion_date DATETIME,
     blockchain_tx_hash VARCHAR(66),
     token_reward INTEGER DEFAULT 10,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT (datetime('now')),
+    updated_at DATETIME DEFAULT (datetime('now'))
 );
 
 -- Task assignments history
@@ -60,7 +60,7 @@ CREATE TABLE task_assignments (
     task_id INTEGER REFERENCES tasks(id),
     assigned_to INTEGER REFERENCES users(id),
     assigned_by INTEGER REFERENCES users(id),
-    assigned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    assigned_at DATETIME DEFAULT (datetime('now')),
     blockchain_tx_hash VARCHAR(66)
 );
 
@@ -72,7 +72,17 @@ CREATE TABLE user_activities (
     activity_type VARCHAR(50) NOT NULL,
     points_earned INTEGER DEFAULT 0,
     blockchain_tx_hash VARCHAR(66),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT (datetime('now'))
+);
+
+-- Streaks table for daily activity tracking
+CREATE TABLE streaks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER REFERENCES users(id),
+    activity_type VARCHAR(50) NOT NULL,
+    description TEXT,
+    file_path VARCHAR(500),
+    created_at DATETIME DEFAULT (datetime('now'))
 );
 
 -- Leagues table
@@ -86,7 +96,7 @@ CREATE TABLE leagues (
     max_members INTEGER DEFAULT 50,
     is_active BOOLEAN DEFAULT 1,
     created_by INTEGER REFERENCES users(id),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT (datetime('now'))
 );
 
 -- User league memberships
@@ -96,7 +106,7 @@ CREATE TABLE user_leagues (
     league_id INTEGER REFERENCES leagues(id),
     total_points INTEGER DEFAULT 0,
     rank INTEGER DEFAULT 0,
-    joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    joined_at DATETIME DEFAULT (datetime('now')),
     UNIQUE(user_id, league_id)
 );
 
@@ -110,7 +120,7 @@ CREATE TABLE weekly_scores (
     tasks_completed INTEGER DEFAULT 0,
     tokens_earned INTEGER DEFAULT 0,
     peer_recognitions INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT (datetime('now'))
 );
 
 -- Head-to-head competitions
@@ -127,7 +137,7 @@ CREATE TABLE head_to_head (
     status VARCHAR(20) DEFAULT 'pending',
     stake_tokens INTEGER DEFAULT 0,
     blockchain_tx_hash VARCHAR(66),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT (datetime('now'))
 );
 
 -- Lottery tickets
@@ -138,20 +148,20 @@ CREATE TABLE lottery_tickets (
     lottery_round INTEGER NOT NULL,
     earned_from VARCHAR(100),
     is_used BOOLEAN DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT (datetime('now'))
 );
 
 -- Lottery rounds
 CREATE TABLE lottery_rounds (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     round_name VARCHAR(100) NOT NULL,
-    start_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+    start_date DATETIME DEFAULT (datetime('now')),
     end_date DATETIME NOT NULL,
     actual_end_date DATETIME,
     winner_id INTEGER REFERENCES users(id),
     perk_description TEXT DEFAULT 'Mystery Perk',
     is_active BOOLEAN DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT (datetime('now'))
 );
 
 -- Polls table
@@ -167,7 +177,7 @@ CREATE TABLE polls (
     is_active BOOLEAN DEFAULT 1,
     blockchain_tx_hash VARCHAR(66),
     completed_at DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT (datetime('now'))
 );
 
 -- Poll votes
@@ -178,7 +188,7 @@ CREATE TABLE poll_votes (
     nominee_id INTEGER REFERENCES users(id),
     tokens_spent INTEGER NOT NULL,
     blockchain_tx_hash VARCHAR(66),
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    created_at DATETIME DEFAULT (datetime('now')),
     UNIQUE(poll_id, voter_id)
 );
 
@@ -192,7 +202,7 @@ CREATE TABLE perk_redemptions (
     status VARCHAR(20) DEFAULT 'pending',
     redemption_code VARCHAR(50),
     blockchain_tx_hash VARCHAR(66),
-    redeemed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    redeemed_at DATETIME DEFAULT (datetime('now'))
 );
 
 -- Create indexes for performance
@@ -200,6 +210,7 @@ CREATE INDEX idx_users_wallet_address ON users(wallet_address);
 CREATE INDEX idx_tasks_assigned_to ON tasks(assigned_to);
 CREATE INDEX idx_tasks_status ON tasks(status);
 CREATE INDEX idx_user_activities_user_date ON user_activities(user_id, activity_date);
+CREATE INDEX idx_streaks_user_date ON streaks(user_id, created_at);
 CREATE INDEX idx_user_leagues_league_id ON user_leagues(league_id);
 CREATE INDEX idx_weekly_scores_week ON weekly_scores(week_number, year);
 CREATE INDEX idx_h2h_participants ON head_to_head(challenger_id, opponent_id);
