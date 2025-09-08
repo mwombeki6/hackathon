@@ -40,11 +40,12 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Make io available to routes
+// Make io available to routes and globally for blockchain events
 app.use((req, res, next) => {
   req.io = io;
   next();
 });
+global.io = io;
 
 // Routes
 app.use('/api/auth', authRoutes);

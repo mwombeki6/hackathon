@@ -420,4 +420,371 @@ router.get('/activities', authenticateToken, requireRole(['admin']), async (req,
   }
 });
 
+// Get comprehensive user dashboard data
+router.get('/dashboard', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // Get user basic info with current tokens
+    const userInfo = await db.query(`
+      SELECT id, username, full_name, email, department, total_tokens, 
+             current_streak, longest_streak, streak_level, badges, wallet_address,
+             created_at
+      FROM users WHERE id = ?
+    `, [userId]);
+    
+    // Get task statistics
+    const taskStats = await db.query(`
+      SELECT 
+        COUNT(*) as total_tasks,
+        COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_tasks,
+        COUNT(CASE WHEN status = 'in_progress' THEN 1 END) as in_progress_tasks,
+        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_tasks,
+        COALESCE(SUM(CASE WHEN status = 'completed' THEN token_reward ELSE 0 END), 0) as tokens_earned
+      FROM tasks 
+      WHERE assigned_to = ?
+    `, [userId]);
+    
+    // Get recent activity (last 30 days)
+    const recentActivity = await db.query(`
+      SELECT activity_type, points_earned, activity_date, blockchain_tx_hash
+      FROM user_activities 
+      WHERE user_id = ? 
+      AND activity_date >= date('now', '-30 days')
+      ORDER BY activity_date DESC 
+      LIMIT 10
+    `, [userId]);
+    
+    // Get league participation
+    const leagueStats = await db.query(`
+      SELECT 
+        l.name as league_name,
+        ul.total_points,
+        ul.rank,
+        l.max_members
+      FROM user_leagues ul
+      JOIN leagues l ON ul.league_id = l.id
+      WHERE ul.user_id = ? AND l.is_active = true
+    `, [userId]);
+    
+    // Get H2H challenge stats
+    const h2hStats = await db.query(`
+      SELECT 
+        COUNT(*) as total_challenges,
+        COUNT(CASE WHEN winner_id = ? THEN 1 END) as wins,
+        COUNT(CASE WHEN (challenger_id = ? OR opponent_id = ?) AND winner_id != ? AND winner_id IS NOT NULL THEN 1 END) as losses,
+        COUNT(CASE WHEN status = 'active' THEN 1 END) as active_challenges
+      FROM head_to_head 
+      WHERE challenger_id = ? OR opponent_id = ?
+    `, [userId, userId, userId, userId, userId, userId]);
+    
+    // Get lottery tickets and wins
+    const lotteryStats = await db.query(`
+      SELECT 
+        COUNT(*) as total_tickets,
+        COUNT(CASE WHEN is_used = true THEN 1 END) as used_tickets
+      FROM lottery_tickets 
+      WHERE user_id = ?
+    `, [userId]);
+    
+    const lotteryWins = await db.query(`
+      SELECT COUNT(*) as lottery_wins
+      FROM lottery_rounds 
+      WHERE winner_id = ?
+    `, [userId]);
+    
+    // Get blockchain token balance if available
+    let blockchainBalance = 0;
+    try {
+      if (userInfo.rows[0]?.wallet_address) {
+        blockchainBalance = await blockchain.getUserTokenBalance(userInfo.rows[0].wallet_address);
+      }
+    } catch (blockchainError) {
+      console.error('Failed to get blockchain balance:', blockchainError);
+    }
+    
+    // Get weekly performance (current week)
+    const weekStart = new Date();
+    weekStart.setDate(weekStart.getDate() - weekStart.getDay());
+    weekStart.setHours(0, 0, 0, 0);
+    
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekEnd.getDate() + 7);
+    
+    const weeklyPerformance = await db.query(`
+      SELECT 
+        COUNT(CASE WHEN status = 'completed' THEN 1 END) as tasks_this_week,
+        COALESCE(SUM(CASE WHEN status = 'completed' THEN token_reward ELSE 0 END), 0) as tokens_this_week
+      FROM tasks 
+      WHERE assigned_to = ? 
+      AND completion_date >= ? 
+      AND completion_date < ?
+    `, [userId, weekStart.toISOString(), weekEnd.toISOString()]);
+    
+    const dashboardData = {
+      user: userInfo.rows[0],
+      statistics: {
+        tasks: taskStats.rows[0],
+        h2h: h2hStats.rows[0],
+        lottery: {
+          ...lotteryStats.rows[0],
+          wins: lotteryWins.rows[0].lottery_wins
+        },
+        weeklyPerformance: weeklyPerformance.rows[0],
+        blockchainBalance
+      },
+      leagues: leagueStats.rows,
+      recentActivity: recentActivity.rows,
+      achievements: {
+        streakLevel: userInfo.rows[0].streak_level,
+        longestStreak: userInfo.rows[0].longest_streak,
+        badges: JSON.parse(userInfo.rows[0].badges || '[]')
+      }
+    };
+    
+    res.json(dashboardData);
+  } catch (error) {
+    console.error('Get dashboard error:', error);
+    res.status(500).json({ error: 'Failed to fetch dashboard data' });
+  }
+});
+
+// Get user leaderboard position and nearby users
+router.get('/leaderboard', authenticateToken, async (req, res) => {
+  try {
+    const { type = 'tokens' } = req.query; // tokens, streak, tasks
+    
+    let orderBy = 'total_tokens';
+    switch (type) {
+      case 'streak':
+        orderBy = 'current_streak';
+        break;
+      case 'tasks':
+        orderBy = 'tasks_completed';
+        break;
+      default:
+        orderBy = 'total_tokens';
+    }
+    
+    // Get user's position
+    const userPosition = await db.query(`
+      SELECT 
+        user_rank
+      FROM (
+        SELECT 
+          id,
+          ROW_NUMBER() OVER (ORDER BY ${orderBy} DESC) as user_rank
+        FROM users
+      ) ranked
+      WHERE id = ?
+    `, [req.user.id]);
+    
+    // Get top 10 users
+    const topUsers = await db.query(`
+      SELECT 
+        u.id, u.username, u.full_name, u.department,
+        u.total_tokens, u.current_streak, u.longest_streak, u.streak_level,
+        COALESCE(task_counts.completed, 0) as tasks_completed,
+        ROW_NUMBER() OVER (ORDER BY u.${orderBy} DESC) as rank
+      FROM users u
+      LEFT JOIN (
+        SELECT 
+          assigned_to,
+          COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed
+        FROM tasks
+        GROUP BY assigned_to
+      ) task_counts ON u.id = task_counts.assigned_to
+      ORDER BY u.${orderBy} DESC
+      LIMIT 10
+    `);
+    
+    // Get users around current user's position
+    const currentRank = userPosition.rows[0]?.user_rank || 1;
+    const nearbyUsers = await db.query(`
+      SELECT 
+        u.id, u.username, u.full_name, u.department,
+        u.total_tokens, u.current_streak, u.longest_streak, u.streak_level,
+        COALESCE(task_counts.completed, 0) as tasks_completed,
+        user_rank as rank
+      FROM (
+        SELECT 
+          id, username, full_name, department, total_tokens, current_streak, 
+          longest_streak, streak_level,
+          ROW_NUMBER() OVER (ORDER BY ${orderBy} DESC) as user_rank
+        FROM users
+      ) u
+      LEFT JOIN (
+        SELECT 
+          assigned_to,
+          COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed
+        FROM tasks
+        GROUP BY assigned_to
+      ) task_counts ON u.id = task_counts.assigned_to
+      WHERE user_rank BETWEEN ? AND ?
+      ORDER BY user_rank
+    `, [Math.max(1, currentRank - 2), currentRank + 2]);
+    
+    res.json({
+      leaderboardType: type,
+      userPosition: currentRank,
+      topUsers: topUsers.rows,
+      nearbyUsers: nearbyUsers.rows
+    });
+  } catch (error) {
+    console.error('Get leaderboard error:', error);
+    res.status(500).json({ error: 'Failed to fetch leaderboard' });
+  }
+});
+
+// Get user achievements and badges
+router.get('/achievements', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // Get current user stats
+    const userStats = await db.query(`
+      SELECT 
+        u.*,
+        COALESCE(task_stats.total_tasks, 0) as total_tasks,
+        COALESCE(task_stats.completed_tasks, 0) as completed_tasks,
+        COALESCE(h2h_stats.total_challenges, 0) as total_challenges,
+        COALESCE(h2h_stats.wins, 0) as h2h_wins,
+        COALESCE(lottery_stats.lottery_wins, 0) as lottery_wins
+      FROM users u
+      LEFT JOIN (
+        SELECT 
+          assigned_to,
+          COUNT(*) as total_tasks,
+          COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed_tasks
+        FROM tasks
+        GROUP BY assigned_to
+      ) task_stats ON u.id = task_stats.assigned_to
+      LEFT JOIN (
+        SELECT 
+          user_id,
+          COUNT(*) as total_challenges,
+          COUNT(CASE WHEN winner_id = user_id THEN 1 END) as wins
+        FROM (
+          SELECT challenger_id as user_id, winner_id FROM head_to_head
+          UNION ALL
+          SELECT opponent_id as user_id, winner_id FROM head_to_head
+        ) all_challenges
+        GROUP BY user_id
+      ) h2h_stats ON u.id = h2h_stats.user_id
+      LEFT JOIN (
+        SELECT winner_id, COUNT(*) as lottery_wins
+        FROM lottery_rounds
+        WHERE winner_id IS NOT NULL
+        GROUP BY winner_id
+      ) lottery_stats ON u.id = lottery_stats.winner_id
+      WHERE u.id = ?
+    `, [userId]);
+    
+    const user = userStats.rows[0];
+    const currentBadges = JSON.parse(user.badges || '[]');
+    const newBadges = [];
+    
+    // Define achievement thresholds and check for new badges
+    const achievements = [
+      {
+        id: 'first_task',
+        name: 'First Steps',
+        description: 'Complete your first task',
+        condition: user.completed_tasks >= 1,
+        icon: '🎯'
+      },
+      {
+        id: 'task_master_10',
+        name: 'Task Master',
+        description: 'Complete 10 tasks',
+        condition: user.completed_tasks >= 10,
+        icon: '⭐'
+      },
+      {
+        id: 'task_champion_50',
+        name: 'Task Champion',
+        description: 'Complete 50 tasks',
+        condition: user.completed_tasks >= 50,
+        icon: '🏆'
+      },
+      {
+        id: 'streak_warrior_7',
+        name: 'Streak Warrior',
+        description: 'Maintain a 7-day streak',
+        condition: user.longest_streak >= 7,
+        icon: '🔥'
+      },
+      {
+        id: 'streak_legend_30',
+        name: 'Streak Legend',
+        description: 'Maintain a 30-day streak',
+        condition: user.longest_streak >= 30,
+        icon: '💎'
+      },
+      {
+        id: 'token_collector_1000',
+        name: 'Token Collector',
+        description: 'Earn 1000 BET tokens',
+        condition: user.total_tokens >= 1000,
+        icon: '💰'
+      },
+      {
+        id: 'h2h_winner',
+        name: 'Head-to-Head Champion',
+        description: 'Win your first H2H challenge',
+        condition: user.h2h_wins >= 1,
+        icon: '⚔️'
+      },
+      {
+        id: 'lottery_winner',
+        name: 'Lucky Winner',
+        description: 'Win a lottery draw',
+        condition: user.lottery_wins >= 1,
+        icon: '🎰'
+      }
+    ];
+    
+    // Check for new achievements
+    for (const achievement of achievements) {
+      if (achievement.condition && !currentBadges.some(badge => badge.id === achievement.id)) {
+        newBadges.push(achievement);
+        currentBadges.push({
+          id: achievement.id,
+          name: achievement.name,
+          description: achievement.description,
+          icon: achievement.icon,
+          earnedAt: new Date().toISOString()
+        });
+      }
+    }
+    
+    // Update user badges if there are new ones
+    if (newBadges.length > 0) {
+      await db.query(
+        'UPDATE users SET badges = ? WHERE id = ?',
+        [JSON.stringify(currentBadges), userId]
+      );
+      
+      // Emit achievement notifications
+      req.io?.to(`user-${userId}`).emit('new-achievements', newBadges);
+    }
+    
+    res.json({
+      allAchievements: achievements,
+      earnedBadges: currentBadges,
+      newBadges,
+      progress: {
+        tasksCompleted: user.completed_tasks,
+        longestStreak: user.longest_streak,
+        totalTokens: user.total_tokens,
+        h2hWins: user.h2h_wins || 0,
+        lotteryWins: user.lottery_wins || 0
+      }
+    });
+  } catch (error) {
+    console.error('Get achievements error:', error);
+    res.status(500).json({ error: 'Failed to fetch achievements' });
+  }
+});
+
 module.exports = router;

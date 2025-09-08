@@ -92,19 +92,27 @@ router.post('/', authenticateToken, requireRole(['project_lead', 'admin']), [
     const task = result.rows[0];
 
     // Create task on blockchain
+    let blockchainData = { txHash: null, taskId: null };
     try {
-      const deadline = dueDate ? Math.floor(new Date(dueDate).getTime() / 1000) : Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
-      const txHash = await blockchain.createTaskOnChain(
-        assignee.rows[0].wallet_address,
+      const deadline = dueDate ? new Date(dueDate).toISOString() : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      blockchainData = await blockchain.createTaskOnChain(
         title,
         description || '',
+        assignee.rows[0].wallet_address,
+        priority,
         deadline,
-        reward
+        [] // tags array - can be expanded later
       );
 
-      // Update task with blockchain transaction hash
-      await db.query('UPDATE tasks SET blockchain_tx_hash = ? WHERE id = ?', [txHash, task.id]);
-      task.blockchain_tx_hash = txHash;
+      // Update task with blockchain data
+      if (blockchainData.txHash) {
+        await db.query(
+          'UPDATE tasks SET blockchain_tx_hash = ?, blockchain_task_id = ? WHERE id = ?', 
+          [blockchainData.txHash, blockchainData.taskId, task.id]
+        );
+        task.blockchain_tx_hash = blockchainData.txHash;
+        task.blockchain_task_id = blockchainData.taskId;
+      }
     } catch (blockchainError) {
       console.error('Blockchain task creation failed:', blockchainError);
       // Continue without blockchain - can be retried later
@@ -117,96 +125,198 @@ router.post('/', authenticateToken, requireRole(['project_lead', 'admin']), [
     `, [task.id, assignedTo, req.user.id]);
 
     // Emit real-time notification
-    req.io.to(`user-${assignedTo}`).emit('task-assigned', {
-      task,
+    req.io?.to(`user-${assignedTo}`).emit('task-assigned', {
+      task: {
+        ...task,
+        creator_name: req.user.username,
+        assignee_name: assignee.rows[0].username
+      },
       assignedBy: req.user.username
     });
 
-    res.status(201).json(task);
+    res.status(201).json({
+      ...task,
+      creator_name: req.user.username,
+      assignee_name: assignee.rows[0].username
+    });
   } catch (error) {
     console.error('Create task error:', error);
     res.status(500).json({ error: 'Failed to create task' });
   }
 });
 
-// Update task status
-router.patch('/:id/status', authenticateToken, [
-  body('status').isIn(['pending', 'in_progress', 'completed', 'cancelled'])
-], async (req, res) => {
+// Start task (change status to in_progress)
+router.patch('/:id/start', authenticateToken, async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
     const taskId = req.params.id;
-    const { status } = req.body;
+    
+    // Get task and verify permissions
+    const taskResult = await db.query(
+      'SELECT t.*, u.wallet_address FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE t.id = ?', 
+      [taskId]
+    );
+    
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    
+    const task = taskResult.rows[0];
+    
+    // Verify user is assignee
+    if (task.assigned_to !== req.user.id) {
+      return res.status(403).json({ error: 'Only assignee can start task' });
+    }
+    
+    if (task.status !== 'pending') {
+      return res.status(400).json({ error: 'Task cannot be started' });
+    }
+    
+    // Update database
+    await db.query('UPDATE tasks SET status = ? WHERE id = ?', ['in_progress', taskId]);
+    
+    // Update blockchain if task was created on blockchain
+    let blockchainTxHash = null;
+    if (task.blockchain_task_id) {
+      try {
+        blockchainTxHash = await blockchain.startTaskOnChain(task.blockchain_task_id, task.wallet_address);
+      } catch (blockchainError) {
+        console.error('Blockchain start task failed:', blockchainError);
+      }
+    }
+    
+    // Emit real-time update
+    req.io?.emit('task-started', { taskId, status: 'in_progress', blockchainTxHash });
+    
+    res.json({ 
+      message: 'Task started successfully',
+      status: 'in_progress',
+      blockchainTxHash
+    });
+  } catch (error) {
+    console.error('Start task error:', error);
+    res.status(500).json({ error: 'Failed to start task' });
+  }
+});
 
+// Complete task
+router.patch('/:id/complete', authenticateToken, async (req, res) => {
+  try {
+    const taskId = req.params.id;
+    
+    // Get task and verify permissions
+    const taskResult = await db.query(
+      'SELECT t.*, u.wallet_address FROM tasks t JOIN users u ON t.assigned_to = u.id WHERE t.id = ?', 
+      [taskId]
+    );
+    
+    if (taskResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+    
+    const task = taskResult.rows[0];
+    
+    // Verify user is assignee
+    if (task.assigned_to !== req.user.id) {
+      return res.status(403).json({ error: 'Only assignee can complete task' });
+    }
+    
+    if (task.status !== 'in_progress') {
+      return res.status(400).json({ error: 'Task must be in progress to complete' });
+    }
+    
+    const completionDate = new Date();
+    
+    // Update database
+    await db.query(
+      'UPDATE tasks SET status = ?, completion_date = ? WHERE id = ?', 
+      ['completed', completionDate, taskId]
+    );
+    
+    // Complete task on blockchain
+    let blockchainResult = { txHash: null, rewardAmount: '0' };
+    if (task.blockchain_task_id) {
+      try {
+        blockchainResult = await blockchain.completeTaskOnChain(task.blockchain_task_id, task.wallet_address);
+      } catch (blockchainError) {
+        console.error('Blockchain complete task failed:', blockchainError);
+      }
+    }
+    
+    // Update streak
+    try {
+      const streakResult = await updateStreak(req.user.id);
+      console.log('Streak updated:', streakResult);
+    } catch (streakError) {
+      console.error('Streak update failed:', streakError);
+    }
+    
+    // Emit real-time update
+    req.io?.emit('task-completed', { 
+      taskId, 
+      status: 'completed',
+      completedBy: req.user.username,
+      rewardAmount: blockchainResult.rewardAmount,
+      blockchainTxHash: blockchainResult.txHash
+    });
+    
+    res.json({ 
+      message: 'Task completed successfully',
+      status: 'completed',
+      completionDate,
+      rewardAmount: blockchainResult.rewardAmount,
+      blockchainTxHash: blockchainResult.txHash
+    });
+  } catch (error) {
+    console.error('Complete task error:', error);
+    res.status(500).json({ error: 'Failed to complete task' });
+  }
+});
+
+// Verify task (for reviewers/admins)
+router.patch('/:id/verify', authenticateToken, requireRole(['reviewer', 'admin']), async (req, res) => {
+  try {
+    const taskId = req.params.id;
+    
     // Get task
     const taskResult = await db.query('SELECT * FROM tasks WHERE id = ?', [taskId]);
     if (taskResult.rows.length === 0) {
       return res.status(404).json({ error: 'Task not found' });
     }
-
+    
     const task = taskResult.rows[0];
-
-    // Check permissions
-    if (req.user.role !== 'admin' && 
-        req.user.id !== task.assigned_to && 
-        req.user.id !== task.created_by) {
-      return res.status(403).json({ error: 'Not authorized to update this task' });
+    
+    if (task.status !== 'completed') {
+      return res.status(400).json({ error: 'Task must be completed to verify' });
     }
-
-    // Update task status
-    const updateResult = await db.query(`
-      UPDATE tasks 
-      SET status = ?, updated_at = datetime('now'),
-          completion_date = CASE WHEN ? = 'completed' THEN datetime('now') ELSE completion_date END
-      WHERE id = ?
-      RETURNING *
-    `, [status, status, taskId]);
-
-    const updatedTask = updateResult.rows[0];
-
-    // Handle task completion
-    if (status === 'completed' && task.status !== 'completed') {
-      // Update user streak
-      await updateStreak(task.assigned_to);
-
-      // Award tokens via blockchain
+    
+    // Update database
+    await db.query('UPDATE tasks SET reviewed_by = ? WHERE id = ?', [req.user.id, taskId]);
+    
+    // Verify on blockchain
+    let blockchainTxHash = null;
+    if (task.blockchain_task_id) {
       try {
-        const assignee = await db.query('SELECT wallet_address FROM users WHERE id = ?', [task.assigned_to]);
-        if (assignee.rows.length > 0) {
-          await blockchain.awardTokens(assignee.rows[0].wallet_address, task.token_reward, 'Task completion');
-          
-          // Issue lottery ticket
-          await blockchain.issueTicket(assignee.rows[0].wallet_address, 'Task completion');
-        }
+        blockchainTxHash = await blockchain.verifyTaskOnChain(task.blockchain_task_id, req.user.wallet_address);
       } catch (blockchainError) {
-        console.error('Blockchain reward failed:', blockchainError);
+        console.error('Blockchain verify task failed:', blockchainError);
       }
-
-      // Log activity
-      await db.query(`
-        INSERT INTO user_activities (user_id, activity_date, activity_type, points_earned)
-        VALUES (?, date('now'), 'task_completed', ?)
-      `, [task.assigned_to, task.token_reward]);
-
-      // Update user total tokens
-      await db.query('UPDATE users SET total_tokens = total_tokens + ? WHERE id = ?', 
-        [task.token_reward, task.assigned_to]);
-
-      // Emit completion notification
-      req.io.to(`user-${task.created_by}`).emit('task-completed', {
-        task: updatedTask,
-        completedBy: req.user.username
-      });
     }
-
-    res.json(updatedTask);
+    
+    // Emit real-time update
+    req.io?.emit('task-verified', { 
+      taskId, 
+      verifiedBy: req.user.username,
+      blockchainTxHash
+    });
+    
+    res.json({ 
+      message: 'Task verified successfully',
+      verifiedBy: req.user.username,
+      blockchainTxHash
+    });
   } catch (error) {
-    console.error('Update task status error:', error);
-    res.status(500).json({ error: 'Failed to update task status' });
+    console.error('Verify task error:', error);
+    res.status(500).json({ error: 'Failed to verify task' });
   }
 });
 

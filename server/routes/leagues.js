@@ -97,13 +97,37 @@ router.post('/:id/join', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'League is full' });
     }
 
-    // Join league
+    // Join league in database
     await db.query(`
       INSERT INTO user_leagues (user_id, league_id)
       VALUES ($1, $2)
     `, [userId, leagueId]);
+    
+    // Join league on blockchain if it exists there
+    let blockchainTxHash = null;
+    if (league.rows[0].blockchain_league_id) {
+      try {
+        blockchainTxHash = await blockchain.joinLeague(
+          league.rows[0].blockchain_league_id,
+          req.user.wallet_address
+        );
+      } catch (blockchainError) {
+        console.error('Blockchain league join failed:', blockchainError);
+      }
+    }
+    
+    // Emit real-time update
+    req.io?.emit('user-joined-league', {
+      leagueId,
+      userId,
+      username: req.user.username,
+      blockchainTxHash
+    });
 
-    res.json({ message: 'Successfully joined league' });
+    res.json({ 
+      message: 'Successfully joined league',
+      blockchainTxHash
+    });
   } catch (error) {
     console.error('Join league error:', error);
     res.status(500).json({ error: 'Failed to join league' });
@@ -169,6 +193,208 @@ router.get('/:id/weekly-scores', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch weekly scores' });
   }
 });
+
+// Update weekly scores (called by cron job or admin)
+router.post('/:id/update-scores', authenticateToken, requireRole(['admin']), async (req, res) => {
+  try {
+    const leagueId = req.params.id;
+    const { week, year } = req.body;
+    
+    const currentWeek = week || getCurrentWeekNumber();
+    const currentYear = year || new Date().getFullYear();
+    
+    // Get all league members
+    const members = await db.query(`
+      SELECT ul.id as user_league_id, ul.user_id, u.username, u.wallet_address
+      FROM user_leagues ul
+      JOIN users u ON ul.user_id = u.id
+      WHERE ul.league_id = ?
+    `, [leagueId]);
+    
+    // Calculate scores for each member for the week
+    for (const member of members.rows) {
+      const weeklyStats = await calculateWeeklyScore(member.user_id, currentWeek, currentYear);
+      
+      // Insert or update weekly score
+      await db.query(`
+        INSERT OR REPLACE INTO weekly_scores 
+        (user_league_id, week_number, year, points, tasks_completed, tokens_earned, peer_recognitions)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `, [
+        member.user_league_id,
+        currentWeek,
+        currentYear,
+        weeklyStats.totalPoints,
+        weeklyStats.tasksCompleted,
+        weeklyStats.tokensEarned,
+        weeklyStats.peerRecognitions
+      ]);
+      
+      // Update total points in user_leagues
+      await db.query(`
+        UPDATE user_leagues 
+        SET total_points = (
+          SELECT COALESCE(SUM(points), 0) 
+          FROM weekly_scores 
+          WHERE user_league_id = ?
+        )
+        WHERE id = ?
+      `, [member.user_league_id, member.user_league_id]);
+    }
+    
+    // Update rankings
+    await updateLeagueRankings(leagueId);
+    
+    // Emit real-time update
+    req.io?.emit('league-scores-updated', {
+      leagueId,
+      week: currentWeek,
+      year: currentYear
+    });
+    
+    res.json({ 
+      message: 'Weekly scores updated successfully',
+      week: currentWeek,
+      year: currentYear
+    });
+  } catch (error) {
+    console.error('Update scores error:', error);
+    res.status(500).json({ error: 'Failed to update scores' });
+  }
+});
+
+// End league season and distribute prizes
+router.post('/:id/end-season', authenticateToken, requireRole(['admin']), async (req, res) => {
+  try {
+    const leagueId = req.params.id;
+    
+    // Get final standings
+    const standings = await db.query(`
+      SELECT 
+        ul.user_id,
+        u.username,
+        u.wallet_address,
+        ul.total_points,
+        ROW_NUMBER() OVER (ORDER BY ul.total_points DESC) as final_rank
+      FROM user_leagues ul
+      JOIN users u ON ul.user_id = u.id
+      WHERE ul.league_id = ?
+      ORDER BY ul.total_points DESC
+      LIMIT 10
+    `, [leagueId]);
+    
+    const winners = standings.rows;
+    
+    // Distribute prizes (top 3)
+    const prizes = [
+      { rank: 1, tokens: 100, title: 'League Champion' },
+      { rank: 2, tokens: 50, title: 'Runner-up' },
+      { rank: 3, tokens: 25, title: 'Third Place' }
+    ];
+    
+    for (const prize of prizes) {
+      const winner = winners.find(w => w.final_rank === prize.rank);
+      if (winner) {
+        try {
+          // Award tokens
+          await blockchain.awardTokens(
+            winner.wallet_address,
+            prize.tokens * 1e18, // Convert to wei
+            `League ${prize.title}`
+          );
+          
+          // Update user tokens in database
+          await db.query(
+            'UPDATE users SET total_tokens = total_tokens + ? WHERE id = ?',
+            [prize.tokens, winner.user_id]
+          );
+        } catch (blockchainError) {
+          console.error('Prize distribution failed:', blockchainError);
+        }
+      }
+    }
+    
+    // Mark league as ended
+    await db.query('UPDATE leagues SET is_active = false WHERE id = ?', [leagueId]);
+    
+    // Emit celebration event
+    req.io?.emit('league-ended', {
+      leagueId,
+      winners: winners.slice(0, 3)
+    });
+    
+    res.json({
+      message: 'League season ended successfully',
+      winners: winners.slice(0, 3)
+    });
+  } catch (error) {
+    console.error('End season error:', error);
+    res.status(500).json({ error: 'Failed to end season' });
+  }
+});
+
+// Helper functions
+async function calculateWeeklyScore(userId, week, year) {
+  // Get week start and end dates
+  const weekStart = getWeekStartDate(week, year);
+  const weekEnd = new Date(weekStart);
+  weekEnd.setDate(weekEnd.getDate() + 7);
+  
+  // Count tasks completed this week
+  const tasksResult = await db.query(`
+    SELECT COUNT(*) as count, COALESCE(SUM(token_reward), 0) as tokens
+    FROM tasks 
+    WHERE assigned_to = ? 
+    AND status = 'completed' 
+    AND completion_date >= ? 
+    AND completion_date < ?
+  `, [userId, weekStart, weekEnd]);
+  
+  const tasksCompleted = parseInt(tasksResult.rows[0].count) || 0;
+  const tokensEarned = parseInt(tasksResult.rows[0].tokens) || 0;
+  
+  // Get peer recognitions (placeholder - would need to implement this feature)
+  const peerRecognitions = 0;
+  
+  // Calculate total points (example scoring system)
+  const totalPoints = (tasksCompleted * 10) + (tokensEarned * 0.1) + (peerRecognitions * 5);
+  
+  return {
+    tasksCompleted,
+    tokensEarned,
+    peerRecognitions,
+    totalPoints: Math.round(totalPoints)
+  };
+}
+
+async function updateLeagueRankings(leagueId) {
+  // Update rank in user_leagues based on total_points
+  await db.query(`
+    WITH ranked_users AS (
+      SELECT 
+        id,
+        ROW_NUMBER() OVER (ORDER BY total_points DESC) as new_rank
+      FROM user_leagues 
+      WHERE league_id = ?
+    )
+    UPDATE user_leagues 
+    SET rank = ranked_users.new_rank
+    FROM ranked_users 
+    WHERE user_leagues.id = ranked_users.id
+  `, [leagueId]);
+}
+
+function getCurrentWeekNumber() {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), 0, 1);
+  return Math.ceil(((now - start) / 86400000 + start.getDay() + 1) / 7);
+}
+
+function getWeekStartDate(week, year) {
+  const jan1 = new Date(year, 0, 1);
+  const daysOffset = (week - 1) * 7 - jan1.getDay();
+  return new Date(year, 0, 1 + daysOffset);
+}
 
 // Leave league
 router.delete('/:id/leave', authenticateToken, async (req, res) => {

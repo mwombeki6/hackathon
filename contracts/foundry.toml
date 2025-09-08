@@ -1,0 +1,17 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.20"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+
+[rpc_endpoints]
+alphachain = "https://rpc.alphachain.live"
+localhost = "http://127.0.0.1:8545"
+
+[etherscan]
+alphachain = { key = "${ETHERSCAN_API_KEY}", url = "https://explorer.alphachain.live/api" }
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

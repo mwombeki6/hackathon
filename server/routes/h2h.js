@@ -99,14 +99,26 @@ router.post('/challenge', authenticateToken, [
         stakeTokens
       );
       
-      await db.query('UPDATE head_to_head SET blockchain_tx_hash = $1 WHERE id = $2', [txHash, challenge.id]);
+      // Update database with blockchain data
+      if (blockchainData.txHash) {
+        await db.query(
+          'UPDATE head_to_head SET blockchain_tx_hash = $1, blockchain_challenge_id = $2 WHERE id = $3', 
+          [blockchainData.txHash, blockchainData.challengeId, challenge.id]
+        );
+        challenge.blockchain_tx_hash = blockchainData.txHash;
+        challenge.blockchain_challenge_id = blockchainData.challengeId;
+      }
     } catch (blockchainError) {
       console.error('Blockchain H2H creation failed:', blockchainError);
     }
 
     // Notify opponent
-    req.io.to(`user-${opponentId}`).emit('h2h-challenge', {
-      challenge,
+    req.io?.to(`user-${opponentId}`).emit('h2h-challenge-received', {
+      challenge: {
+        ...challenge,
+        challenger_name: req.user.username,
+        opponent_name: opponent.rows[0].username
+      },
       challenger: req.user.username
     });
 
@@ -144,20 +156,33 @@ router.post('/:id/accept', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Insufficient tokens for stake' });
     }
 
-    // Accept challenge
+    // Accept challenge in database and blockchain
     try {
       await db.query('BEGIN TRANSACTION');
       
       await db.query(`
         UPDATE head_to_head 
-        SET status = 'active', start_date = date('now') 
+        SET status = 'active', start_date = datetime('now') 
         WHERE id = ?
       `, [challengeId]);
 
-      // Deduct stake from opponent
+      // Deduct wager from opponent
       await db.query('UPDATE users SET total_tokens = total_tokens - ? WHERE id = ?', [match.stake_tokens, userId]);
 
       await db.query('COMMIT');
+      
+      // Accept on blockchain if exists
+      let blockchainTxHash = null;
+      if (match.blockchain_challenge_id) {
+        try {
+          blockchainTxHash = await blockchain.acceptH2HChallenge(
+            match.blockchain_challenge_id,
+            req.user.wallet_address
+          );
+        } catch (blockchainError) {
+          console.error('Blockchain accept challenge failed:', blockchainError);
+        }
+      }
     } catch (dbError) {
       await db.query('ROLLBACK');
       throw dbError;
@@ -274,5 +299,174 @@ router.delete('/:id', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to cancel challenge' });
   }
 });
+
+// Finalize/Complete H2H challenge (called by system or admin)
+router.post('/:id/finalize', authenticateToken, async (req, res) => {
+  try {
+    const challengeId = req.params.id;
+    
+    // Get challenge details
+    const challengeResult = await db.query(`
+      SELECT h.*, 
+             c.username as challenger_username, c.wallet_address as challenger_wallet,
+             o.username as opponent_username, o.wallet_address as opponent_wallet
+      FROM head_to_head h
+      JOIN users c ON h.challenger_id = c.id
+      JOIN users o ON h.opponent_id = o.id
+      WHERE h.id = ? AND h.status = 'active'
+    `, [challengeId]);
+    
+    if (challengeResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Active challenge not found' });
+    }
+    
+    const challenge = challengeResult.rows[0];
+    
+    // Calculate scores based on challenge type
+    const scores = await calculateH2HScores(
+      challenge.challenger_id, 
+      challenge.opponent_id, 
+      challenge.challenge_type,
+      challenge.start_date,
+      challenge.end_date,
+      challenge.target_value
+    );
+    
+    // Determine winner
+    const winnerId = scores.challengerScore >= scores.opponentScore ? 
+      challenge.challenger_id : challenge.opponent_id;
+    const winnerWallet = winnerId === challenge.challenger_id ?
+      challenge.challenger_wallet : challenge.opponent_wallet;
+      
+    const totalPrize = challenge.stake_tokens * 2; // Both players staked
+    const platformFee = Math.floor(totalPrize * 0.05); // 5% fee
+    const winnerPrize = totalPrize - platformFee;
+    
+    // Update database
+    await db.query(`
+      UPDATE head_to_head 
+      SET status = 'completed', 
+          winner_id = ?, 
+          challenger_score = ?, 
+          opponent_score = ?,
+          completed_at = datetime('now')
+      WHERE id = ?
+    `, [winnerId, scores.challengerScore, scores.opponentScore, challengeId]);
+    
+    // Award prize to winner
+    await db.query(
+      'UPDATE users SET total_tokens = total_tokens + ? WHERE id = ?',
+      [winnerPrize, winnerId]
+    );
+    
+    // Finalize on blockchain
+    let blockchainTxHash = null;
+    if (challenge.blockchain_challenge_id) {
+      try {
+        blockchainTxHash = await blockchain.finalizeH2HChallenge(
+          challenge.blockchain_challenge_id,
+          req.user.wallet_address
+        );
+      } catch (blockchainError) {
+        console.error('Blockchain finalize challenge failed:', blockchainError);
+      }
+    }
+    
+    // Emit results
+    req.io?.emit('h2h-completed', {
+      challengeId,
+      winnerId,
+      winnerUsername: winnerId === challenge.challenger_id ? 
+        challenge.challenger_username : challenge.opponent_username,
+      challengerScore: scores.challengerScore,
+      opponentScore: scores.opponentScore,
+      prize: winnerPrize,
+      blockchainTxHash
+    });
+    
+    res.json({
+      message: 'Challenge completed successfully',
+      winner: {
+        id: winnerId,
+        username: winnerId === challenge.challenger_id ? 
+          challenge.challenger_username : challenge.opponent_username
+      },
+      scores: {
+        challenger: scores.challengerScore,
+        opponent: scores.opponentScore
+      },
+      prize: winnerPrize,
+      blockchainTxHash
+    });
+  } catch (error) {
+    console.error('Finalize H2H challenge error:', error);
+    res.status(500).json({ error: 'Failed to finalize challenge' });
+  }
+});
+
+// Helper function to calculate H2H scores
+async function calculateH2HScores(challengerId, opponentId, challengeType, startDate, endDate, targetValue) {
+  let challengerScore = 0;
+  let opponentScore = 0;
+  
+  switch (challengeType) {
+    case 'TaskCompletion':
+      // Count tasks completed during challenge period
+      const taskResults = await Promise.all([
+        db.query(`
+          SELECT COUNT(*) as count FROM tasks 
+          WHERE assigned_to = ? AND status = 'completed' 
+          AND completion_date >= ? AND completion_date <= ?
+        `, [challengerId, startDate, endDate]),
+        db.query(`
+          SELECT COUNT(*) as count FROM tasks 
+          WHERE assigned_to = ? AND status = 'completed' 
+          AND completion_date >= ? AND completion_date <= ?
+        `, [opponentId, startDate, endDate])
+      ]);
+      challengerScore = parseInt(taskResults[0].rows[0].count) || 0;
+      opponentScore = parseInt(taskResults[1].rows[0].count) || 0;
+      break;
+      
+    case 'TokenEarning':
+      // Count tokens earned during challenge period
+      const tokenResults = await Promise.all([
+        db.query(`
+          SELECT COALESCE(SUM(points_earned), 0) as total FROM user_activities 
+          WHERE user_id = ? AND activity_date >= ? AND activity_date <= ?
+        `, [challengerId, startDate, endDate]),
+        db.query(`
+          SELECT COALESCE(SUM(points_earned), 0) as total FROM user_activities 
+          WHERE user_id = ? AND activity_date >= ? AND activity_date <= ?
+        `, [opponentId, startDate, endDate])
+      ]);
+      challengerScore = parseInt(tokenResults[0].rows[0].total) || 0;
+      opponentScore = parseInt(tokenResults[1].rows[0].total) || 0;
+      break;
+      
+    case 'Streak':
+      // Compare current streaks
+      const streakResults = await Promise.all([
+        db.query('SELECT current_streak FROM users WHERE id = ?', [challengerId]),
+        db.query('SELECT current_streak FROM users WHERE id = ?', [opponentId])
+      ]);
+      challengerScore = parseInt(streakResults[0].rows[0].current_streak) || 0;
+      opponentScore = parseInt(streakResults[1].rows[0].current_streak) || 0;
+      break;
+      
+    case 'Custom':
+      // For custom challenges, use target value as score (would need custom logic)
+      challengerScore = Math.floor(Math.random() * (targetValue || 100));
+      opponentScore = Math.floor(Math.random() * (targetValue || 100));
+      break;
+      
+    default:
+      // Default to task completion
+      challengerScore = 0;
+      opponentScore = 0;
+  }
+  
+  return { challengerScore, opponentScore };
+}
 
 module.exports = router;
