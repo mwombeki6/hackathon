@@ -1,6 +1,6 @@
 # BlockEngage - Blockchain Task Management Platform
 
-A unified blockchain-powered task management platform with gamification features for office environments, deployed on AlphachainLive network.
+A unified blockchain-powered task management platform with gamification features for office environments, deployed on AlphachainLive network
 
 ## Features
 
